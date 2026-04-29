@@ -5,6 +5,7 @@ import { ComfyWidgets } from "../../scripts/widgets.js";
 const EXT_ID = "ComfyUI.TagComplete";
 const STYLE_ID = "comfyui-tagcomplete-style";
 const TYPE_ORDER = {
+    current_tag: -1,
     tag: 0,
     extra: 1,
     wildcard_file: 2,
@@ -15,6 +16,9 @@ const TYPE_ORDER = {
     lyco: 7,
     hypernetwork: 8,
 };
+const CURRENT_TAG_TYPE = "current_tag";
+const WEIGHT_BUTTON_STEP = 0.2;
+const WEIGHT_FINE_STEP = 0.05;
 
 const state = {
     bootstrap: null,
@@ -111,6 +115,27 @@ const STYLE = `
 }
 .tc-count-button:hover {
     background: rgba(39, 54, 76, 0.96);
+}
+.tc-weight-button {
+    border: 1px solid rgba(129, 180, 255, 0.76);
+    background: rgba(37, 99, 235, 0.24);
+    color: #eef2ff;
+    border-radius: 8px;
+    padding: 6px 10px;
+    min-width: 54px;
+    font-size: 13px;
+    font-weight: 700;
+    cursor: pointer;
+}
+.tc-weight-button:hover {
+    background: rgba(37, 99, 235, 0.38);
+}
+.tc-weight-button.tc-weight-down {
+    border-color: rgba(251, 146, 60, 0.72);
+    background: rgba(194, 65, 12, 0.22);
+}
+.tc-weight-button.tc-weight-down:hover {
+    background: rgba(194, 65, 12, 0.34);
 }
 .tc-preview {
     display: none;
@@ -504,6 +529,110 @@ function normalToken(before) {
     return match[1].replace(/^\s+/, "");
 }
 
+function formatPromptWeight(weight) {
+    const numeric = Number.isFinite(weight) ? weight : 1;
+    return String(Math.round(numeric * 100) / 100);
+}
+
+function parsePromptTagSegment(raw, absoluteStart = 0) {
+    const value = String(raw || "");
+    const leading = value.match(/^\s*/)?.[0].length || 0;
+    const trailing = value.match(/\s*$/)?.[0].length || 0;
+    const contentEnd = Math.max(leading, value.length - trailing);
+    const trimmed = value.slice(leading, contentEnd);
+    const trimmedStart = absoluteStart + leading;
+    const trimmedEnd = absoluteStart + contentEnd;
+
+    let coreStartInTrimmed = 0;
+    let coreEndInTrimmed = trimmed.length;
+    let weight = null;
+    let hasExplicitWeight = false;
+    let hasImplicitWeight = false;
+    let isParenWrapped = false;
+
+    if (trimmed.startsWith("(") && trimmed.endsWith(")") && trimmed.length >= 2) {
+        isParenWrapped = true;
+        const weightMatch = trimmed.match(/:\s*([-+]?(?:\d+(?:\.\d+)?|\.\d+))\)$/);
+        coreStartInTrimmed = 1;
+        if (weightMatch && weightMatch.index > 1) {
+            coreEndInTrimmed = weightMatch.index;
+            weight = Number.parseFloat(weightMatch[1]);
+            hasExplicitWeight = Number.isFinite(weight);
+        } else {
+            coreEndInTrimmed = trimmed.length - 1;
+            weight = 1.1;
+            hasImplicitWeight = true;
+        }
+    }
+
+    while (coreStartInTrimmed < coreEndInTrimmed && /\s/.test(trimmed[coreStartInTrimmed])) {
+        coreStartInTrimmed += 1;
+    }
+    while (coreEndInTrimmed > coreStartInTrimmed && /\s/.test(trimmed[coreEndInTrimmed - 1])) {
+        coreEndInTrimmed -= 1;
+    }
+
+    const core = trimmed.slice(coreStartInTrimmed, coreEndInTrimmed);
+    return {
+        raw: value,
+        text: trimmed,
+        start: trimmedStart,
+        end: trimmedEnd,
+        core,
+        coreStart: trimmedStart + coreStartInTrimmed,
+        coreEnd: trimmedStart + coreEndInTrimmed,
+        weight,
+        hasExplicitWeight,
+        hasImplicitWeight,
+        isParenWrapped,
+    };
+}
+
+function getSearchableTagText(value) {
+    const parsed = parsePromptTagSegment(value);
+    if (parsed.isParenWrapped) {
+        return parsed.core;
+    }
+    const trimmed = parsed.text;
+    if (!trimmed.startsWith("<")) {
+        const unwrappedWeight = trimmed.match(/^(.+?):\s*[-+]?(?:\d+(?:\.\d+)?|\.\d+)$/);
+        if (unwrappedWeight) {
+            return unwrappedWeight[1].trim();
+        }
+    }
+    return trimmed;
+}
+
+function adjustPromptTagWeight(value, delta) {
+    const parsed = parsePromptTagSegment(value);
+    const core = parsed.core || parsed.text;
+    const currentWeight = parsed.isParenWrapped && Number.isFinite(parsed.weight) ? parsed.weight : 1;
+    const nextWeight = Math.round(Math.max(0, currentWeight + delta) * 100) / 100;
+    if (nextWeight === 1) {
+        return core;
+    }
+    return `(${core}:${formatPromptWeight(nextWeight)})`;
+}
+
+function findPreviousPromptDelimiter(value, position) {
+    const scanFrom = Math.max(0, position - 1);
+    return [",", ";", "\n"].reduce((best, delimiter) => {
+        const index = value.lastIndexOf(delimiter, scanFrom);
+        return index > best ? index : best;
+    }, -1);
+}
+
+function findNextPromptDelimiter(value, position) {
+    let best = -1;
+    for (const delimiter of [",", ";", "\n"]) {
+        const index = value.indexOf(delimiter, position);
+        if (index > -1 && (best === -1 || index < best)) {
+            best = index;
+        }
+    }
+    return best;
+}
+
 function typeLabel(type) {
     switch (type) {
         case "extra":
@@ -753,6 +882,7 @@ class TagCompleteTextArea {
         this.selectedIndex = 0;
         this.visible = false;
         this.activeToken = "";
+        this.activeSegmentContext = null;
         this.isApplyingResult = false;
         this.selectionUseCounts = new Map();
         this.manualCountClicks = new Map();
@@ -879,6 +1009,47 @@ class TagCompleteTextArea {
         return { before, token, start };
     }
 
+    getPromptSegmentContext(requireCurrentTagTarget = false) {
+        const value = this.el?.value || "";
+        const selectionStart = this.el?.selectionStart ?? value.length;
+        const selectionEnd = this.el?.selectionEnd ?? selectionStart;
+        if (selectionStart !== selectionEnd) {
+            return null;
+        }
+
+        const previousDelimiter = findPreviousPromptDelimiter(value, selectionStart);
+        const nextDelimiter = findNextPromptDelimiter(value, selectionEnd);
+        const segmentStart = previousDelimiter + 1;
+        const segmentEnd = nextDelimiter > -1 ? nextDelimiter : value.length;
+        const previousDelimiterChar = previousDelimiter > -1 ? value[previousDelimiter] : "";
+        const nextDelimiterChar = nextDelimiter > -1 ? value[nextDelimiter] : "";
+        const commaBounded = previousDelimiterChar === "," && nextDelimiterChar === ",";
+        const lineStartCommaTarget =
+            nextDelimiterChar === "," && (previousDelimiter === -1 || previousDelimiterChar === "\n");
+        const currentTagTarget = commaBounded || lineStartCommaTarget;
+
+        if (requireCurrentTagTarget && !currentTagTarget) {
+            return null;
+        }
+
+        const parsed = parsePromptTagSegment(value.slice(segmentStart, segmentEnd), segmentStart);
+        if (!parsed.text || !parsed.core) {
+            return null;
+        }
+        if (selectionStart < parsed.start || selectionEnd > parsed.end) {
+            return null;
+        }
+
+        return {
+            parsed,
+            token: getSearchableTagText(parsed.text),
+            commaBounded,
+            currentTagTarget,
+            previousDelimiter,
+            nextDelimiter,
+        };
+    }
+
     getApplyRange(fallbackToken = "") {
         const value = this.el?.value || "";
         const selectionEnd = this.lastSelectionEnd ?? this.el?.selectionEnd ?? value.length;
@@ -889,6 +1060,26 @@ class TagCompleteTextArea {
                 start: selectionStart,
                 end: selectionEnd,
             };
+        }
+
+        if (this.activeSegmentContext?.parsed) {
+            const parsed = this.activeSegmentContext.parsed;
+            if (parsed.isParenWrapped && parsed.coreStart < parsed.coreEnd) {
+                return {
+                    token: parsed.core,
+                    start: parsed.coreStart,
+                    end: parsed.coreEnd,
+                    suppressPad: true,
+                };
+            }
+            if (this.activeSegmentContext.currentTagTarget) {
+                return {
+                    token: parsed.text,
+                    start: parsed.start,
+                    end: parsed.end,
+                    suppressPad: false,
+                };
+            }
         }
 
         let scanEnd = selectionEnd;
@@ -1010,7 +1201,7 @@ class TagCompleteTextArea {
     }
 
     async searchNormal(term) {
-        const query = term.trim().replace(/\s+/g, "_").toLowerCase();
+        const query = getSearchableTagText(term).trim().replace(/\s+/g, "_").toLowerCase();
         if (!query) {
             return [];
         }
@@ -1220,19 +1411,67 @@ class TagCompleteTextArea {
         return this.decorateSessionBoost(results);
     }
 
+    makeCurrentTagResult(context) {
+        const parsed = context.parsed;
+        const title = getSearchableTagText(parsed.text);
+        const currentWeight = parsed.isParenWrapped && Number.isFinite(parsed.weight) ? parsed.weight : 1;
+        return {
+            id: `${CURRENT_TAG_TYPE}:${parsed.start}:${parsed.end}:${parsed.text}`,
+            type: CURRENT_TAG_TYPE,
+            title,
+            subtitle: `Weight ${formatPromptWeight(currentWeight)}`,
+            meta: "Current",
+            value: parsed.text,
+            frequencyName: title,
+            count: 0,
+            baseScore: Number.MAX_SAFE_INTEGER,
+            score: Number.MAX_SAFE_INTEGER,
+            previewKind: null,
+            currentTagContext: context,
+            currentWeight,
+        };
+    }
+
+    prependCurrentTagResult(results, context) {
+        if (!context || isSpecialToken(context.parsed.core)) {
+            return results;
+        }
+        const current = this.makeCurrentTagResult(context);
+        return [current, ...results];
+    }
+
     async buildResults() {
-        const { token } = this.getCursorContext();
-        if (!token) {
-            return { token: "", results: [] };
+        const cursorContext = this.getCursorContext();
+        const segmentContext = this.getPromptSegmentContext(false);
+        const currentTagContext = segmentContext?.currentTagTarget ? segmentContext : null;
+        let token = cursorContext.token;
+        if (segmentContext?.parsed?.isParenWrapped && segmentContext.token) {
+            const parsed = segmentContext.parsed;
+            if (cursorContext.start >= parsed.coreStart && cursorContext.start <= parsed.coreEnd) {
+                token = this.el.value.slice(parsed.coreStart, cursorContext.start).replace(/^\s+/, "");
+            } else if (!token || cursorContext.start > parsed.coreEnd) {
+                token = segmentContext.token;
+            }
         }
 
+        if (!token) {
+            const currentResults = currentTagContext ? this.prependCurrentTagResult([], currentTagContext) : [];
+            return { token: "", results: currentResults, segmentContext };
+        }
+
+        let results = [];
         if (token.startsWith(state.config.wcWrap || "__")) {
-            return { token, results: await this.searchWildcards(token) };
+            results = await this.searchWildcards(token);
+        } else if (token.startsWith("<")) {
+            results = await this.searchAngle(token);
+        } else {
+            results = await this.searchNormal(token);
         }
-        if (token.startsWith("<")) {
-            return { token, results: await this.searchAngle(token) };
-        }
-        return { token, results: await this.searchNormal(token) };
+        return {
+            token,
+            results: this.prependCurrentTagResult(results, currentTagContext),
+            segmentContext,
+        };
     }
 
     async update() {
@@ -1243,10 +1482,16 @@ class TagCompleteTextArea {
             return;
         }
 
-        const { token, results } = await this.buildResults();
+        const { token, results, segmentContext } = await this.buildResults();
         this.activeToken = token;
-        this.results = state.config.showAllResults ? results : results.slice(0, state.config.maxResults || 20);
-        this.selectedIndex = Math.max(0, Math.min(this.selectedIndex, this.results.length - 1));
+        this.activeSegmentContext = segmentContext;
+        const maxResults = state.config.maxResults || 20;
+        const visibleLimit = results[0]?.type === CURRENT_TAG_TYPE ? maxResults + 1 : maxResults;
+        this.results = state.config.showAllResults ? results : results.slice(0, visibleLimit);
+        this.selectedIndex =
+            this.results[0]?.type === CURRENT_TAG_TYPE
+                ? 0
+                : Math.max(0, Math.min(this.selectedIndex, this.results.length - 1));
         if (!this.results.length) {
             this.hide();
             return;
@@ -1317,27 +1562,57 @@ class TagCompleteTextArea {
             indexLabel.textContent = index < 9 ? `${index + 1}` : "";
             side.appendChild(indexLabel);
 
-            const countButton = document.createElement("button");
-            countButton.type = "button";
-            countButton.className = "tc-count-button";
-            countButton.textContent = `Count+ ${result.manualBoostClicks || 0}`;
-            countButton.title = `Next +${computeManualCountIncrease((result.manualBoostClicks || 0) + 1)}`;
-            markNoTranslate(countButton, "en");
-            countButton.addEventListener("pointerdown", (event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                this.suppressBlurUntil = Date.now() + 250;
-            });
-            countButton.addEventListener("mousedown", (event) => {
-                event.preventDefault();
-                event.stopPropagation();
-            });
-            countButton.addEventListener("click", async (event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                await this.incrementResultCount(result);
-            });
-            side.appendChild(countButton);
+            if (result.type === CURRENT_TAG_TYPE) {
+                const makeWeightButton = (label, delta, className = "") => {
+                    const button = document.createElement("button");
+                    button.type = "button";
+                    button.className = `tc-weight-button ${className}`.trim();
+                    button.textContent = label;
+                    button.title = `${delta > 0 ? "Increase" : "Decrease"} weight`;
+                    markNoTranslate(button, "en");
+                    button.addEventListener("pointerdown", (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        this.suppressBlurUntil = Date.now() + 250;
+                    });
+                    button.addEventListener("mousedown", (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                    });
+                    button.addEventListener("click", async (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        await this.applyCurrentTagWeight(result, delta);
+                    });
+                    return button;
+                };
+                side.append(
+                    makeWeightButton("-0.2", -WEIGHT_BUTTON_STEP, "tc-weight-down"),
+                    makeWeightButton("+0.2", WEIGHT_BUTTON_STEP)
+                );
+            } else {
+                const countButton = document.createElement("button");
+                countButton.type = "button";
+                countButton.className = "tc-count-button";
+                countButton.textContent = `Count+ ${result.manualBoostClicks || 0}`;
+                countButton.title = `Next +${computeManualCountIncrease((result.manualBoostClicks || 0) + 1)}`;
+                markNoTranslate(countButton, "en");
+                countButton.addEventListener("pointerdown", (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    this.suppressBlurUntil = Date.now() + 250;
+                });
+                countButton.addEventListener("mousedown", (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                });
+                countButton.addEventListener("click", async (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    await this.incrementResultCount(result);
+                });
+                side.appendChild(countButton);
+            }
 
             if (result.meta) {
                 const pill = document.createElement("span");
@@ -1461,6 +1736,14 @@ class TagCompleteTextArea {
             return;
         }
 
+        const selectedResult = this.results[this.selectedIndex];
+        if (selectedResult?.type === CURRENT_TAG_TYPE && ["ArrowLeft", "ArrowRight"].includes(event.key)) {
+            event.preventDefault();
+            const delta = event.key === "ArrowRight" ? WEIGHT_FINE_STEP : -WEIGHT_FINE_STEP;
+            this.applyCurrentTagWeight(selectedResult, delta, { keepOpen: true });
+            return;
+        }
+
         const digitMatch = event.key.match(/^[1-9]$/);
         if (digitMatch) {
             const index = Number.parseInt(event.key, 10) - 1;
@@ -1491,7 +1774,7 @@ class TagCompleteTextArea {
 
     onKeyUp(event) {
         this.captureSelection();
-        if (["ArrowUp", "ArrowDown", "Tab", "Enter", "Escape"].includes(event.key)) {
+        if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Tab", "Enter", "Escape"].includes(event.key)) {
             return;
         }
         this.updateDebounced();
@@ -1550,8 +1833,67 @@ class TagCompleteTextArea {
         }
     }
 
+    resolveCurrentTagContext(result) {
+        const fresh = this.getPromptSegmentContext(true);
+        if (fresh && !isSpecialToken(fresh.parsed.core)) {
+            return fresh;
+        }
+        const context = result?.currentTagContext || null;
+        if (!context || !this.el) {
+            return null;
+        }
+        if (this.el.value.slice(context.parsed.start, context.parsed.end) !== context.parsed.text) {
+            return null;
+        }
+        return context;
+    }
+
+    async applyCurrentTagWeight(result, delta = WEIGHT_BUTTON_STEP, options = {}) {
+        this.refreshElementBinding();
+        if (!this.el) {
+            return;
+        }
+        const context = this.resolveCurrentTagContext(result);
+        if (!context) {
+            return;
+        }
+
+        const start = context.parsed.start;
+        const end = context.parsed.end;
+        const value = adjustPromptTagWeight(this.el.value.slice(start, end), delta);
+
+        this.el.focus();
+        this.el.setSelectionRange(start, end);
+        this.el.setRangeText(value, start, end, "end");
+        this.mirrorValueToWidget(this.el.value || "");
+        this.captureSelection();
+        dispatchTextEvents(this.el);
+        if (options.keepOpen && this.visible) {
+            const nextContext = this.getPromptSegmentContext(true);
+            if (nextContext) {
+                this.activeSegmentContext = nextContext;
+                const currentIndex = this.results.findIndex((item) => item.type === CURRENT_TAG_TYPE);
+                if (currentIndex > -1) {
+                    this.results[currentIndex] = this.makeCurrentTagResult(nextContext);
+                    this.selectedIndex = currentIndex;
+                } else {
+                    this.results.unshift(this.makeCurrentTagResult(nextContext));
+                    this.selectedIndex = 0;
+                }
+                this.render();
+                return;
+            }
+        }
+        this.hide();
+    }
+
     async applyResult(result) {
         if (!result) {
+            return;
+        }
+
+        if (result.type === CURRENT_TAG_TYPE) {
+            await this.applyCurrentTagWeight(result, WEIGHT_BUTTON_STEP);
             return;
         }
 
@@ -1567,6 +1909,7 @@ class TagCompleteTextArea {
 
         const after = this.el.value.slice(this.el.selectionEnd);
         const shouldPad =
+            !applyRange.suppressPad &&
             !["lora", "lyco", "hypernetwork", "wildcard_file"].includes(result.type) &&
             !after.trimStart().startsWith(",") &&
             !after.startsWith("\n");
@@ -1600,6 +1943,7 @@ class TagCompleteTextArea {
 
     hide() {
         this.visible = false;
+        this.activeSegmentContext = null;
         this.previewRequestKey = "";
         this.dropdown.remove();
         this.previewHost.style.display = "none";
